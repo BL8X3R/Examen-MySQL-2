@@ -1,72 +1,136 @@
 -- ============================================================
--- ARCHIVO: triggers.sql
--- Un trigger es codigo que se ejecuta SOLO cuando pasa algo
--- especifico en una tabla (INSERT o UPDATE), sin que nadie lo
--- tenga que llamar a mano.
+-- TRIGGERS Y PROCEDIMIENTOS - PIZZERÍA DON PICCOLO
 -- ============================================================
-
 USE pizzeria_don_piccolo;
 
+-- ------------------------------------------------------------
+-- 1. Evita vender una pizza si algún ingrediente no alcanza.
+-- ------------------------------------------------------------
+DROP TRIGGER IF EXISTS trg_validar_stock;
 DELIMITER $$
+CREATE TRIGGER trg_validar_stock
+BEFORE INSERT ON detalle_pedido
+FOR EACH ROW
+BEGIN
+    DECLARE v_faltantes INT DEFAULT 0;
 
+    SELECT COUNT(*)
+      INTO v_faltantes
+      FROM pizza_ingredientes pi
+      JOIN ingredientes i ON i.id_ingrediente = pi.id_ingrediente
+     WHERE pi.id_pizza = NEW.id_pizza
+       AND i.stock < (pi.cantidad * NEW.cantidad);
+
+    IF v_faltantes > 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'No hay suficiente stock para preparar esta pizza.';
+    END IF;
+END$$
+DELIMITER ;
 
 -- ------------------------------------------------------------
--- TRIGGER 1: trg_actualizar_stock
--- Se activa DESPUES de insertar en detalle_pedido (alguien pide
--- una pizza). Descuenta del stock de ingredientes lo que se
--- gasta en preparar esa pizza, segun su receta.
+-- 2. Descuenta ingredientes automáticamente al registrar una
+--    pizza dentro de un pedido.
 -- ------------------------------------------------------------
-CREATE TRIGGER trg_actualizar_stock
+DROP TRIGGER IF EXISTS trg_descontar_stock;
+DELIMITER $$
+CREATE TRIGGER trg_descontar_stock
 AFTER INSERT ON detalle_pedido
 FOR EACH ROW
 BEGIN
-    -- UPDATE con JOIN: por cada ingrediente que necesita la
-    -- pizza pedida (NEW.id_precio dice cual pizza y tamano fue),
-    -- le restamos stock segun la receta (cantidad_necesaria)
-    -- multiplicada por cuantas pizzas se pidieron (NEW.cantidad).
     UPDATE ingredientes i
-    INNER JOIN pizza_ingredientes pi ON i.id_ingrediente = pi.id_ingrediente
-    INNER JOIN pizza_precios pp ON pi.id_pizza = pp.id_pizza
-    SET i.stock = i.stock - (pi.cantidad_necesaria * NEW.cantidad)
-    WHERE pp.id_precio = NEW.id_precio;
+    JOIN pizza_ingredientes pi ON pi.id_ingrediente = i.id_ingrediente
+       SET i.stock = i.stock - (pi.cantidad * NEW.cantidad)
+     WHERE pi.id_pizza = NEW.id_pizza;
 END$$
-
+DELIMITER ;
 
 -- ------------------------------------------------------------
--- TRIGGER 2: trg_historial_precios
--- Se activa DESPUES de actualizar un precio en pizza_precios.
--- Si el precio realmente cambio, guarda el cambio en
--- historial_precios (auditoria).
+-- 3. Guarda el precio anterior y el nuevo cuando cambia una
+--    pizza.
 -- ------------------------------------------------------------
-CREATE TRIGGER trg_historial_precios
-AFTER UPDATE ON pizza_precios
+DROP TRIGGER IF EXISTS trg_historial_precio;
+DELIMITER $$
+CREATE TRIGGER trg_historial_precio
+AFTER UPDATE ON pizzas
 FOR EACH ROW
 BEGIN
-    -- Solo registramos si el precio nuevo es distinto al viejo
-    IF OLD.precio <> NEW.precio THEN
-        INSERT INTO historial_precios (id_precio, precio_anterior, precio_nuevo, fecha_cambio)
-        VALUES (NEW.id_precio, OLD.precio, NEW.precio, NOW());
+    IF OLD.precio_base <> NEW.precio_base THEN
+        INSERT INTO historial_precios
+            (id_pizza, precio_anterior, precio_nuevo)
+        VALUES
+            (NEW.id_pizza, OLD.precio_base, NEW.precio_base);
     END IF;
 END$$
-
+DELIMITER ;
 
 -- ------------------------------------------------------------
--- TRIGGER 3: trg_repartidor_disponible
--- Se activa DESPUES de actualizar un domicilio. Cuando se
--- registra la hora_entrega (antes estaba vacia, ahora tiene
--- valor), el repartidor vuelve a quedar "disponible".
+-- 4. Procedimiento para registrar una entrega.
+--    Cambia domicilio, pedido y estado del repartidor.
 -- ------------------------------------------------------------
-CREATE TRIGGER trg_repartidor_disponible
+DROP PROCEDURE IF EXISTS registrar_entrega;
+DELIMITER $$
+CREATE PROCEDURE registrar_entrega(
+    IN p_id_domicilio INT,
+    IN p_hora_entrega DATETIME
+)
+BEGIN
+    DECLARE v_pedido INT;
+    DECLARE v_repartidor INT;
+
+    SELECT id_pedido, id_repartidor
+      INTO v_pedido, v_repartidor
+      FROM domicilios
+     WHERE id_domicilio = p_id_domicilio;
+
+    UPDATE domicilios
+       SET hora_entrega = p_hora_entrega
+     WHERE id_domicilio = p_id_domicilio;
+
+    UPDATE pedidos
+       SET estado = 'entregado'
+     WHERE id_pedido = v_pedido;
+
+    UPDATE repartidores
+       SET estado = 'disponible'
+     WHERE id_repartidor = v_repartidor;
+END$$
+DELIMITER ;
+
+-- ------------------------------------------------------------
+-- 5. Si se registra hora de entrega directamente en domicilios,
+--    el pedido pasa a entregado y el repartidor queda disponible.
+-- ------------------------------------------------------------
+DROP TRIGGER IF EXISTS trg_entrega_domicilio;
+DELIMITER $$
+CREATE TRIGGER trg_entrega_domicilio
 AFTER UPDATE ON domicilios
 FOR EACH ROW
 BEGIN
-    -- OLD.hora_entrega IS NULL: antes no estaba entregado
-    -- NEW.hora_entrega IS NOT NULL: ahora ya se registro
     IF OLD.hora_entrega IS NULL AND NEW.hora_entrega IS NOT NULL THEN
+        UPDATE pedidos
+           SET estado = 'entregado'
+         WHERE id_pedido = NEW.id_pedido;
+
         UPDATE repartidores
-        SET estado = 'disponible'
-        WHERE id_repartidor = NEW.id_repartidor;
+           SET estado = 'disponible'
+         WHERE id_repartidor = NEW.id_repartidor;
     END IF;
 END$$
+DELIMITER ;
 
+-- ------------------------------------------------------------
+-- 6. Cuando se asigna un domicilio a un repartidor, se marca
+--    como no disponible mientras realiza la entrega.
+-- ------------------------------------------------------------
+DROP TRIGGER IF EXISTS trg_repartidor_asignado;
+DELIMITER $$
+CREATE TRIGGER trg_repartidor_asignado
+AFTER INSERT ON domicilios
+FOR EACH ROW
+BEGIN
+    UPDATE repartidores
+       SET estado = 'no disponible'
+     WHERE id_repartidor = NEW.id_repartidor;
+END$$
 DELIMITER ;
